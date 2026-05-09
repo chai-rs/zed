@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+#
+# Build Kez.app / Kez.dmg for personal use on macOS.
+#
+# Wraps script/bundle-mac (which builds Zed) and post-processes the output
+# so the DMG, volume name, and target paths use "Kez". Does not modify any
+# upstream files, so syncing with zed-industries/zed stays clean.
+#
+# Branding source: crates/zed/Cargo.toml [package.metadata.bundle-dev] sets
+# name = "Kez", so cargo bundle already produces Kez.app — this script just
+# fixes up the DMG packaging that bundle-mac hardcodes to "Zed".
+#
+# Usage:
+#   script/bundle-kez                    # build release DMG
+#   script/bundle-kez -i                 # build release + install to /Applications/Kez.app
+#   script/bundle-kez -d -i              # debug build (faster), install
+#   script/bundle-kez --native           # build with -C target-cpu=native (max perf, this Mac only)
+#   script/bundle-kez --open             # open DMG dir / launched app when done
+#
+# Performance notes:
+#   - Default release profile already matches official Zed (lto = "thin",
+#     codegen-units = 1). Safe and fast.
+#   - --native adds RUSTFLAGS=-C target-cpu=native. Marginal perf win,
+#     binary won't run on older Macs. Recommended for personal builds.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+DEBUG=false
+INSTALL=false
+OPEN=false
+NATIVE=false
+EXTRA_ARGS=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d) DEBUG=true; shift ;;
+        -i) INSTALL=true; shift ;;
+        -o|--open) OPEN=true; shift ;;
+        --native) NATIVE=true; shift ;;
+        -h|--help)
+            sed -n '3,25p' "$0"
+            exit 0
+            ;;
+        *)  EXTRA_ARGS+=("$1"); shift ;;
+    esac
+done
+
+# Confirm Kez branding is in place. If a future upstream sync overwrites it,
+# fail loudly instead of producing a "Zed.app" with a misleading name.
+if ! grep -q '^name = "Kez"$' crates/zed/Cargo.toml; then
+    echo "ERROR: crates/zed/Cargo.toml does not contain Kez branding." >&2
+    echo "  Expected line: name = \"Kez\" (under [package.metadata.bundle-dev])" >&2
+    echo "  An upstream sync may have reverted it. Re-apply your branding patch." >&2
+    exit 1
+fi
+
+if [ "$NATIVE" = true ]; then
+    export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native"
+    echo "==> RUSTFLAGS=$RUSTFLAGS"
+fi
+
+bundle_mac_args=()
+[ "$DEBUG" = true ]   && bundle_mac_args+=("-d")
+[ "$INSTALL" = true ] && bundle_mac_args+=("-i")
+[ "$OPEN" = true ]    && bundle_mac_args+=("-o")
+
+echo "==> Running script/bundle-mac ${bundle_mac_args[*]:-}"
+script/bundle-mac "${bundle_mac_args[@]}" "${EXTRA_ARGS[@]}"
+
+# bundle-mac produces:
+#   - target/<triple>/release/bundle/osx/Kez.app    (cargo bundle reads bundle-dev metadata)
+#   - target/<triple>/release/Zed-<arch>.dmg        (hardcoded "Zed-" in bundle-mac:248)
+#
+# In debug mode, no DMG is produced. Skip rename in that case.
+if [ "$DEBUG" = true ]; then
+    echo "==> Debug build: skipping DMG rename"
+    exit 0
+fi
+
+# Detect the target triple bundle-mac used.
+host_arch=$(uname -m)
+case "$host_arch" in
+    arm64)  target_triple="aarch64-apple-darwin"; arch_suffix="aarch64" ;;
+    x86_64) target_triple="x86_64-apple-darwin";  arch_suffix="x86_64"  ;;
+    *)
+        echo "ERROR: Unsupported architecture: $host_arch" >&2
+        exit 1
+        ;;
+esac
+
+dmg_dir="target/${target_triple}/release"
+zed_dmg="${dmg_dir}/Zed-${arch_suffix}.dmg"
+kez_dmg="${dmg_dir}/Kez-${arch_suffix}.dmg"
+
+if [ -f "$zed_dmg" ]; then
+    echo "==> Renaming DMG to Kez branding"
+    mv -f "$zed_dmg" "$kez_dmg"
+
+    # The volume name baked into the DMG is still "Zed". Rebuild the DMG with
+    # volname Kez so when someone double-clicks it the mounted volume reads
+    # "Kez". The .app inside is already named Kez.app.
+    src_dir="${dmg_dir}/dmg-kez-staging"
+    rm -rf "$src_dir"
+    mkdir -p "$src_dir"
+
+    mount_point=$(hdiutil attach -nobrowse -noverify -noautoopen "$kez_dmg" | tail -1 | awk '{print $3}')
+    cp -R "$mount_point/"* "$src_dir/"
+    hdiutil detach "$mount_point" -quiet
+
+    # Re-add the /Applications symlink so users can drag-install.
+    ln -s /Applications "$src_dir/Applications"
+
+    rm -f "$kez_dmg"
+    hdiutil create -volname Kez -srcfolder "$src_dir" -ov -format UDZO "$kez_dmg" >/dev/null
+    rm -rf "$src_dir"
+
+    echo "==> Built: $kez_dmg"
+fi
+
+if [ "$INSTALL" = true ] && [ -d "/Applications/Kez.app" ]; then
+    echo "==> Installed: /Applications/Kez.app"
+fi
