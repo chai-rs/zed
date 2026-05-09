@@ -129,6 +129,10 @@ if [ -f "$zed_dmg" ]; then
     hdiutil detach "$mount_point" -quiet
 
     # Re-add the /Applications symlink so users can drag-install.
+    # bundle-mac may have already baked one into the mounted DMG; remove first
+    # so `ln -s` doesn't resolve into the existing symlink and try to create
+    # /Applications/Applications.
+    rm -f "$src_dir/Applications"
     ln -s /Applications "$src_dir/Applications"
 
     rm -f "$kez_dmg"
