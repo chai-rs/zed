@@ -67,7 +67,7 @@ bundle_mac_args=()
 [ "$OPEN" = true ]    && bundle_mac_args+=("-o")
 
 echo "==> Running script/bundle-mac ${bundle_mac_args[*]:-}"
-script/bundle-mac "${bundle_mac_args[@]}" "${EXTRA_ARGS[@]}"
+script/bundle-mac ${bundle_mac_args[@]+"${bundle_mac_args[@]}"} ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 
 # bundle-mac produces:
 #   - target/<triple>/release/bundle/osx/Kez.app    (cargo bundle reads bundle-dev metadata)
