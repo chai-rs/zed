@@ -61,21 +61,34 @@ if [ "$NATIVE" = true ]; then
     echo "==> RUSTFLAGS=$RUSTFLAGS"
 fi
 
+# NOTE: We deliberately do NOT pass -i to bundle-mac. Upstream bundle-mac moves
+# Kez.app to /Applications BEFORE its DMG step, which then fails because the
+# bundle path is empty. Instead we let bundle-mac build + DMG, then install
+# ourselves at the end from the staging dir bundle-mac leaves intact.
 bundle_mac_args=()
-[ "$DEBUG" = true ]   && bundle_mac_args+=("-d")
-[ "$INSTALL" = true ] && bundle_mac_args+=("-i")
-[ "$OPEN" = true ]    && bundle_mac_args+=("-o")
+[ "$DEBUG" = true ] && bundle_mac_args+=("-d")
+# -o is also handled below, not forwarded.
 
 echo "==> Running script/bundle-mac ${bundle_mac_args[*]:-}"
-script/bundle-mac ${bundle_mac_args[@]+"${bundle_mac_args[@]}"} ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+# Tolerate non-zero exit from bundle-mac. Upstream bundle-mac runs cosmetic
+# post-DMG steps (dmg-license EULA, codesign with Apple key, notarization)
+# that fail in a personal/local build. The DMG itself is created before any
+# of those steps, so we can salvage it as long as the file exists.
+bundle_mac_status=0
+script/bundle-mac ${bundle_mac_args[@]+"${bundle_mac_args[@]}"} ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} || bundle_mac_status=$?
 
-# bundle-mac produces:
-#   - target/<triple>/release/bundle/osx/Kez.app    (cargo bundle reads bundle-dev metadata)
-#   - target/<triple>/release/Zed-<arch>.dmg        (hardcoded "Zed-" in bundle-mac:248)
+if [ "$bundle_mac_status" -ne 0 ]; then
+    echo "==> bundle-mac exited with status $bundle_mac_status — checking if DMG was produced anyway"
+fi
+
+# bundle-mac (without -i) produces:
+#   - target/<triple>/release/bundle/osx/Kez.app   then moves to:
+#   - target/<triple>/release/dmg/Kez.app          (post-DMG, bundle-mac leaves this in place)
+#   - target/<triple>/release/Zed-<arch>.dmg       (hardcoded "Zed-" in bundle-mac:248)
 #
-# In debug mode, no DMG is produced. Skip rename in that case.
+# In debug mode, no DMG is produced and no install staging exists.
 if [ "$DEBUG" = true ]; then
-    echo "==> Debug build: skipping DMG rename"
+    echo "==> Debug build: no DMG/install post-processing"
     exit 0
 fi
 
@@ -93,6 +106,12 @@ esac
 dmg_dir="target/${target_triple}/release"
 zed_dmg="${dmg_dir}/Zed-${arch_suffix}.dmg"
 kez_dmg="${dmg_dir}/Kez-${arch_suffix}.dmg"
+
+if [ ! -f "$zed_dmg" ]; then
+    echo "ERROR: expected DMG at $zed_dmg, not found." >&2
+    echo "  bundle-mac likely failed before hdiutil create. See log above." >&2
+    exit 1
+fi
 
 if [ -f "$zed_dmg" ]; then
     echo "==> Renaming DMG to Kez branding"
@@ -119,6 +138,27 @@ if [ -f "$zed_dmg" ]; then
     echo "==> Built: $kez_dmg"
 fi
 
-if [ "$INSTALL" = true ] && [ -d "/Applications/Kez.app" ]; then
-    echo "==> Installed: /Applications/Kez.app"
+staged_app="${dmg_dir}/dmg/Kez.app"
+
+if [ "$INSTALL" = true ]; then
+    if [ -d "$staged_app" ]; then
+        echo "==> Installing to /Applications/Kez.app"
+        rm -rf "/Applications/Kez.app"
+        cp -R "$staged_app" "/Applications/Kez.app"
+        echo "==> Installed: /Applications/Kez.app"
+    else
+        echo "ERROR: expected staged app at $staged_app, not found" >&2
+        echo "  bundle-mac may have changed its layout. Skipping install." >&2
+        exit 1
+    fi
+fi
+
+if [ "$OPEN" = true ]; then
+    if [ "$INSTALL" = true ]; then
+        echo "==> Opening /Applications/Kez.app"
+        open "/Applications/Kez.app"
+    elif [ -f "$kez_dmg" ]; then
+        echo "==> Revealing $kez_dmg in Finder"
+        open -R "$kez_dmg"
+    fi
 fi
