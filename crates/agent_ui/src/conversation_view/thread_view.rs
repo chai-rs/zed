@@ -281,12 +281,16 @@ pub struct ThreadView {
     pub model_selector: Option<Entity<ModelSelectorPopover>>,
     pub profile_selector: Option<Entity<ProfileSelector>>,
     pub permission_dropdown_handle: PopoverMenuHandle<ContextMenu>,
-    pub thread_retry_status: Option<RetryStatus>,
+    pub(super) thread_retry_status: Option<RetryStatus>,
     pub(super) thread_error: Option<ThreadError>,
     pub thread_error_markdown: Option<Entity<Markdown>>,
     pub token_limit_callout_dismissed: bool,
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
+    pub auto_prompt_enabled: bool,
+    pub auto_prompt_state: crate::auto_prompt::AutoPromptState,
+    pub _auto_prompt_task: Option<gpui::Task<()>>,
+    pub _auto_prompt_retry_data: Option<auto_prompt::LlmCallData>,
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     /// Tracks which tool calls have their content/output expanded.
@@ -384,6 +388,7 @@ impl ThreadView {
         let placeholder = placeholder_text(agent_display_name.as_ref(), has_commands);
 
         let mut should_auto_submit = false;
+        let mut should_auto_prompt = true;
         let mut show_external_source_prompt_warning = false;
 
         let message_editor = cx.new(|cx| {
@@ -410,8 +415,26 @@ impl ThreadView {
                     AgentInitialContent::ContentBlock {
                         blocks,
                         auto_submit,
+                        auto_prompt_enabled,
+                        profile_id,
                     } => {
                         should_auto_submit = auto_submit;
+                        should_auto_prompt = auto_prompt_enabled;
+                        if let Some(ref id) = profile_id {
+                            let connection = thread.read(cx).connection().clone();
+                            let session_id = thread.read(cx).session_id().clone();
+                            if let Some(native_connection) =
+                                connection.downcast::<agent::NativeAgentConnection>()
+                            {
+                                if let Some(native_thread) =
+                                    native_connection.thread(&session_id, cx)
+                                {
+                                    native_thread.update(cx, |t, cx| {
+                                        t.set_profile(AgentProfileId(id.clone().into()), cx);
+                                    });
+                                }
+                            }
+                        }
                         editor.set_message(blocks, window, cx);
                     }
                     AgentInitialContent::FromExternalSource(prompt) => {
@@ -517,6 +540,10 @@ impl ThreadView {
             token_limit_callout_dismissed: false,
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
+            auto_prompt_enabled: should_auto_prompt,
+            auto_prompt_state: Default::default(),
+            _auto_prompt_task: None,
+            _auto_prompt_retry_data: None,
             expanded_tool_calls: HashSet::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
             expanded_thinking_blocks: HashSet::default(),
@@ -1028,6 +1055,13 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Cancel any running auto_prompt task — user input takes priority.
+        if self._auto_prompt_task.is_some() {
+            log::info!("[auto_prompt] Cancelling auto_prompt: user message takes priority");
+            self._auto_prompt_task = None;
+            self.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+        }
+
         let session_id = self.thread.read(cx).session_id().clone();
         let parent_session_id = self.thread.read(cx).parent_session_id().cloned();
         let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();
@@ -3271,6 +3305,7 @@ impl ThreadView {
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
+                                    .child(self.render_auto_prompt_toggle(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
                             )
@@ -4244,6 +4279,163 @@ impl ThreadView {
                 this.toggle_following(window, cx);
             }))
     }
+
+    fn render_auto_prompt_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let enabled = self.auto_prompt_enabled;
+
+        let is_processing = matches!(
+            self.auto_prompt_state,
+            crate::auto_prompt::AutoPromptState::Processing
+        );
+        let is_failed = matches!(
+            self.auto_prompt_state,
+            crate::auto_prompt::AutoPromptState::Failed
+        );
+
+        let (label, label_color) = if is_processing {
+            ("Processing...", Color::Accent)
+        } else if is_failed {
+            ("Retry", Color::Error)
+        } else if enabled {
+            ("Auto", Color::Accent)
+        } else {
+            ("Off", Color::Muted)
+        };
+
+        Button::new("auto-prompt-toggle", label)
+            .start_icon(
+                Icon::new(IconName::Sparkle)
+                    .size(IconSize::XSmall)
+                    .color(label_color),
+            )
+            .label_size(LabelSize::XSmall)
+            .color(label_color)
+            .when(enabled && !is_processing && !is_failed, |this| {
+                this.style(ButtonStyle::Tinted(TintColor::Accent))
+            })
+            .tooltip(move |_, cx| {
+                Tooltip::for_action("Auto-Prompt", &crate::auto_prompt::ToggleAutoPrompt, cx)
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if is_processing {
+                    log::info!("[auto_prompt] Cancelling auto-prompt processing");
+                    this._auto_prompt_task = None;
+                    this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                    auto_prompt::reset_iteration();
+                    cx.notify();
+                    return;
+                }
+                if is_failed {
+                    log::info!("[auto_prompt] Manual retry triggered by user");
+                    if let Some(retry_data) = this._auto_prompt_retry_data.take() {
+                        let retry_data_for_restore = retry_data.clone();
+                        auto_prompt::reset_llm_failure_count(); // Reset counter for fresh retry
+                        this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Processing;
+                        cx.notify();
+
+                        let conversation_view = this.server_view.clone();
+
+                        this._auto_prompt_task = Some(cx.spawn_in(window, async move |_this, cx| {
+                            let thread_weak = conversation_view
+                                .update_in(cx, |cv, _window, _cx| {
+                                    cv.active_thread()
+                                        .map(|tv| tv.downgrade())
+                                })
+                                .unwrap_or(None);
+
+                            let result = auto_prompt::decide_with_llm(retry_data, cx).await;
+
+                            log::info!("[auto_prompt] Retry LLM call completed");
+
+                            match result {
+                                Ok(auto_prompt::AutoPromptOutcome::Continue(action)) => {
+                                    if let Some(ref tv) = thread_weak {
+                                        if let Err(err) = tv.update(cx, |tv, cx| {
+                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                            tv._auto_prompt_retry_data = None;
+                                            cx.notify();
+                                        }) {
+                                            log::warn!("[auto_prompt] failed to reset state after retry: {err}");
+                                        }
+                                    }
+
+                                    log::info!("[auto_prompt] Retry succeeded - dispatching action");
+                                    match conversation_view.update_in(cx, |_cv, window, cx| {
+                                        let action = Box::new(crate::auto_prompt::AutoPromptNewThread {
+                                            from_session_id: action.from_session_id,
+                                            from_title: action.from_title,
+                                            next_prompt: action.next_prompt,
+                                            work_dirs: action.work_dirs,
+                                            original_user_message: action.original_user_message,
+                                            profile_id: action.profile_id,
+                                        });
+                                        window.dispatch_action(action, cx);
+                                    }) {
+                                        Ok(()) => {
+                                            log::info!("[auto_prompt] Retry dispatch submitted");
+                                        }
+                                        Err(err) => {
+                                            log::warn!("[auto_prompt] FAILED to dispatch retry action (view may have been dropped): {err}");
+                                        }
+                                    }
+                                }
+                                Ok(auto_prompt::AutoPromptOutcome::Stopped { reason }) => {
+                                    if let Some(ref tv) = thread_weak {
+                                        if let Err(err) = tv.update(cx, |tv, cx| {
+                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                            tv._auto_prompt_retry_data = None;
+                                            cx.notify();
+                                        }) {
+                                            log::warn!("[auto_prompt] failed to reset state on retry stop: {err}");
+                                        }
+                                    }
+                                    log::info!("[auto_prompt] Retry chain stopped: {reason}");
+                                }
+                                Err(err) => {
+                                    // Retry failed again - set back to Failed state and restore retry data
+                                    if let Some(ref tv) = thread_weak {
+                                        if let Err(update_err) = tv.update(cx, |tv, cx| {
+                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Failed;
+                                            tv._auto_prompt_retry_data = Some(retry_data_for_restore);
+                                            cx.notify();
+                                        }) {
+                                            log::warn!("[auto_prompt] failed to set Failed state after retry: {update_err}");
+                                        }
+                                    }
+                                    log::warn!(
+                                        "[auto_prompt] Retry failed: {err}"
+                                    );
+                                }
+                            }
+                        }));
+                    } else {
+                        log::warn!("[auto_prompt] No retry data available, cannot retry");
+                        this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                        cx.notify();
+                    }
+                    return;
+                }
+
+                let new_enabled = !this.auto_prompt_enabled;
+                this.auto_prompt_enabled = new_enabled;
+                log::info!(
+                    "auto_prompt: {}",
+                    if this.auto_prompt_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                if let Some(workspace) = this.workspace.upgrade() {
+                    if let Some(panel) = workspace.read(cx).panel::<crate::AgentPanel>(cx) {
+                        panel.update(cx, |panel, _| {
+                            panel.set_auto_prompt_enabled(new_enabled);
+                        });
+                    }
+                }
+                cx.notify();
+            }))
+    }
 }
 
 struct TokenUsageTooltip {
@@ -4925,6 +5117,15 @@ impl ThreadView {
                 }
             }));
 
+        let manual_auto_prompt = IconButton::new("manual-auto-prompt", IconName::Sparkle)
+            .shape(ui::IconButtonShape::Square)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Ignored)
+            .tooltip(Tooltip::text("Auto Prompt"))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.manual_auto_prompt(window, cx);
+            }));
+
         let scroll_to_recent_user_prompt =
             IconButton::new("scroll_to_recent_user_prompt", IconName::ForwardArrow)
                 .shape(ui::IconButtonShape::Square)
@@ -5095,6 +5296,7 @@ impl ThreadView {
 
         container
             .child(open_as_markdown)
+            .child(manual_auto_prompt)
             .child(scroll_to_recent_user_prompt)
             .child(scroll_to_top)
             .into_any_element()
@@ -5302,6 +5504,75 @@ impl ThreadView {
             })?;
             anyhow::Ok(())
         })
+    }
+
+    fn manual_auto_prompt(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let thread = self.thread.read(cx);
+
+        let session_id = thread.session_id().clone();
+        let title = thread.title().map(|t| t.to_string());
+        let work_dirs = thread.work_dirs().map(|pl| pl.paths().to_vec());
+        let profile_id = self.current_mode_id(cx).map(|id| id.to_string());
+
+        let first_user_message = thread.entries().iter().find_map(|entry| match entry {
+            AgentThreadEntry::UserMessage(msg) => {
+                let content = msg.content.to_markdown(cx).to_string();
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(content)
+                }
+            }
+            _ => None,
+        });
+
+        let last_assistant_message = thread.entries().iter().rev().find_map(|entry| match entry {
+            AgentThreadEntry::AssistantMessage(msg) => {
+                let content = msg
+                    .chunks
+                    .iter()
+                    .filter_map(|chunk| {
+                        let block = match chunk {
+                            acp_thread::AssistantMessageChunk::Message { block } => block,
+                            acp_thread::AssistantMessageChunk::Thought { block } => block,
+                        };
+                        let text = block.to_markdown(cx).to_string();
+                        if text.is_empty() { None } else { Some(text) }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(content)
+                }
+            }
+            _ => None,
+        });
+
+        let original_user_message = first_user_message
+            .as_deref()
+            .and_then(auto_prompt::extract_original_user_message);
+
+        let continue_prompt = "Review your progress and continue any remaining work. If everything is complete, commit all changes with conventional commit messages.".to_string();
+
+        let next_prompt = auto_prompt::with_first_prompt_context(
+            continue_prompt,
+            original_user_message.as_deref(),
+            title.as_deref(),
+            last_assistant_message.as_deref(),
+        );
+
+        let action = Box::new(crate::auto_prompt::AutoPromptNewThread {
+            from_session_id: session_id,
+            from_title: title,
+            next_prompt,
+            work_dirs,
+            original_user_message,
+            profile_id,
+        });
+
+        window.dispatch_action(action, cx);
     }
 
     pub(crate) fn sync_editor_mode_for_empty_state(&mut self, cx: &mut Context<Self>) {

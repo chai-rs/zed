@@ -633,7 +633,7 @@ impl LanguageModel for OpenCodeLanguageModel {
                 let mode = if self.supports_thinking() && request.thinking_allowed {
                     anthropic::AnthropicModelMode::AdaptiveThinking
                 } else {
-                    anthropic::AnthropicModelMode::Default
+                    anthropic::AnthropicModelMode::Auto
                 };
                 let anthropic_request = into_anthropic(
                     request,
@@ -702,7 +702,7 @@ impl LanguageModel for OpenCodeLanguageModel {
                 let google_request = into_google(
                     request,
                     self.model.id().to_string(),
-                    google_ai::GoogleModelMode::Default,
+                    google_ai::GoogleModelMode::Auto,
                 );
                 let stream = self.stream_google(google_request, http_client, cx);
                 async move {

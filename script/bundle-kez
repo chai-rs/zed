@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+#
+# Build Kez.app / Kez.dmg for personal use on macOS.
+#
+# Wraps script/bundle-mac (which builds Zed) and post-processes the output
+# so the DMG, volume name, and target paths use "Kez". Does not modify any
+# upstream files, so syncing with zed-industries/zed stays clean.
+#
+# Branding source: crates/zed/Cargo.toml [package.metadata.bundle-dev] sets
+# name = "Kez", so cargo bundle already produces Kez.app — this script just
+# fixes up the DMG packaging that bundle-mac hardcodes to "Zed".
+#
+# Usage:
+#   script/bundle-kez                    # build release DMG
+#   script/bundle-kez -i                 # build release + install to /Applications/Kez.app
+#   script/bundle-kez -d -i              # debug build (faster), install
+#   script/bundle-kez --native           # build with -C target-cpu=native (max perf, this Mac only)
+#   script/bundle-kez --open             # open DMG dir / launched app when done
+#
+# Performance notes:
+#   - Default release profile already matches official Zed (lto = "thin",
+#     codegen-units = 1). Safe and fast.
+#   - --native adds RUSTFLAGS=-C target-cpu=native. Marginal perf win,
+#     binary won't run on older Macs. Recommended for personal builds.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+DEBUG=false
+INSTALL=false
+OPEN=false
+NATIVE=false
+EXTRA_ARGS=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d) DEBUG=true; shift ;;
+        -i) INSTALL=true; shift ;;
+        -o|--open) OPEN=true; shift ;;
+        --native) NATIVE=true; shift ;;
+        -h|--help)
+            sed -n '3,25p' "$0"
+            exit 0
+            ;;
+        *)  EXTRA_ARGS+=("$1"); shift ;;
+    esac
+done
+
+# Confirm Kez branding is in place. If a future upstream sync overwrites it,
+# fail loudly instead of producing a "Zed.app" with a misleading name.
+if ! grep -q '^name = "Kez"$' crates/zed/Cargo.toml; then
+    echo "ERROR: crates/zed/Cargo.toml does not contain Kez branding." >&2
+    echo "  Expected line: name = \"Kez\" (under [package.metadata.bundle-dev])" >&2
+    echo "  An upstream sync may have reverted it. Re-apply your branding patch." >&2
+    exit 1
+fi
+
+if [ "$NATIVE" = true ]; then
+    export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native"
+    echo "==> RUSTFLAGS=$RUSTFLAGS"
+fi
+
+# NOTE: We deliberately do NOT pass -i to bundle-mac. Upstream bundle-mac moves
+# Kez.app to /Applications BEFORE its DMG step, which then fails because the
+# bundle path is empty. Instead we let bundle-mac build + DMG, then install
+# ourselves at the end from the staging dir bundle-mac leaves intact.
+bundle_mac_args=()
+[ "$DEBUG" = true ] && bundle_mac_args+=("-d")
+# -o is also handled below, not forwarded.
+
+echo "==> Running script/bundle-mac ${bundle_mac_args[*]:-}"
+# Tolerate non-zero exit from bundle-mac. Upstream bundle-mac runs cosmetic
+# post-DMG steps (dmg-license EULA, codesign with Apple key, notarization)
+# that fail in a personal/local build. The DMG itself is created before any
+# of those steps, so we can salvage it as long as the file exists.
+bundle_mac_status=0
+script/bundle-mac ${bundle_mac_args[@]+"${bundle_mac_args[@]}"} ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} || bundle_mac_status=$?
+
+if [ "$bundle_mac_status" -ne 0 ]; then
+    echo "==> bundle-mac exited with status $bundle_mac_status — checking if DMG was produced anyway"
+fi
+
+# bundle-mac (without -i) produces:
+#   - target/<triple>/release/bundle/osx/Kez.app   then moves to:
+#   - target/<triple>/release/dmg/Kez.app          (post-DMG, bundle-mac leaves this in place)
+#   - target/<triple>/release/Zed-<arch>.dmg       (hardcoded "Zed-" in bundle-mac:248)
+#
+# In debug mode, no DMG is produced and no install staging exists.
+if [ "$DEBUG" = true ]; then
+    echo "==> Debug build: no DMG/install post-processing"
+    exit 0
+fi
+
+# Detect the target triple bundle-mac used.
+host_arch=$(uname -m)
+case "$host_arch" in
+    arm64)  target_triple="aarch64-apple-darwin"; arch_suffix="aarch64" ;;
+    x86_64) target_triple="x86_64-apple-darwin";  arch_suffix="x86_64"  ;;
+    *)
+        echo "ERROR: Unsupported architecture: $host_arch" >&2
+        exit 1
+        ;;
+esac
+
+dmg_dir="target/${target_triple}/release"
+zed_dmg="${dmg_dir}/Zed-${arch_suffix}.dmg"
+kez_dmg="${dmg_dir}/Kez-${arch_suffix}.dmg"
+
+if [ ! -f "$zed_dmg" ]; then
+    echo "ERROR: expected DMG at $zed_dmg, not found." >&2
+    echo "  bundle-mac likely failed before hdiutil create. See log above." >&2
+    exit 1
+fi
+
+if [ -f "$zed_dmg" ]; then
+    echo "==> Renaming DMG to Kez branding"
+    mv -f "$zed_dmg" "$kez_dmg"
+
+    # The volume name baked into the DMG is still "Zed". Rebuild the DMG with
+    # volname Kez so when someone double-clicks it the mounted volume reads
+    # "Kez". The .app inside is already named Kez.app.
+    src_dir="${dmg_dir}/dmg-kez-staging"
+    rm -rf "$src_dir"
+    mkdir -p "$src_dir"
+
+    mount_point=$(hdiutil attach -nobrowse -noverify -noautoopen "$kez_dmg" | tail -1 | awk '{print $3}')
+    cp -R "$mount_point/"* "$src_dir/"
+    hdiutil detach "$mount_point" -quiet
+
+    # Re-add the /Applications symlink so users can drag-install.
+    ln -s /Applications "$src_dir/Applications"
+
+    rm -f "$kez_dmg"
+    hdiutil create -volname Kez -srcfolder "$src_dir" -ov -format UDZO "$kez_dmg" >/dev/null
+    rm -rf "$src_dir"
+
+    echo "==> Built: $kez_dmg"
+fi
+
+staged_app="${dmg_dir}/dmg/Kez.app"
+
+if [ "$INSTALL" = true ]; then
+    if [ -d "$staged_app" ]; then
+        echo "==> Installing to /Applications/Kez.app"
+        rm -rf "/Applications/Kez.app"
+        cp -R "$staged_app" "/Applications/Kez.app"
+        echo "==> Installed: /Applications/Kez.app"
+    else
+        echo "ERROR: expected staged app at $staged_app, not found" >&2
+        echo "  bundle-mac may have changed its layout. Skipping install." >&2
+        exit 1
+    fi
+fi
+
+if [ "$OPEN" = true ]; then
+    if [ "$INSTALL" = true ]; then
+        echo "==> Opening /Applications/Kez.app"
+        open "/Applications/Kez.app"
+    elif [ -f "$kez_dmg" ]; then
+        echo "==> Revealing $kez_dmg in Finder"
+        open -R "$kez_dmg"
+    fi
+fi

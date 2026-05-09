@@ -33,6 +33,7 @@ use zed_actions::{
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
+use crate::auto_prompt::{AutoPromptNewThread, ToggleAutoPrompt};
 use crate::completion_provider::AgentContextSource;
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
@@ -226,6 +227,44 @@ pub fn init(cx: &mut App) {
                         }
                     },
                 )
+                .register_action(|workspace, action: &AutoPromptNewThread, window, cx| {
+                    log::info!(
+                        "[auto_prompt] AutoPromptNewThread action received in Workspace handler (from_session_id={:?})",
+                        action.from_session_id
+                    );
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.auto_prompt_new_thread(action, window, cx)
+                        });
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    } else {
+                        log::warn!(
+                            "[auto_prompt] AutoPromptNewThread DROPPED: AgentPanel not found in workspace"
+                        );
+                    }
+                })
+                .register_action(|workspace, _: &ToggleAutoPrompt, _window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            if let Some(tv) = panel.active_thread_view(cx) {
+                                let new_enabled = !tv.read(cx).auto_prompt_enabled;
+                                tv.update(cx, |tv, cx| {
+                                    tv.auto_prompt_enabled = new_enabled;
+                                    log::info!(
+                                        "auto_prompt: {}",
+                                        if tv.auto_prompt_enabled {
+                                            "enabled"
+                                        } else {
+                                            "disabled"
+                                        }
+                                    );
+                                    cx.notify();
+                                });
+                                panel.auto_prompt_enabled = new_enabled;
+                            }
+                        });
+                    }
+                })
                 .register_action(|workspace, _: &ExpandMessageEditor, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
@@ -382,6 +421,8 @@ pub fn init(cx: &mut App) {
                             Some(AgentInitialContent::ContentBlock {
                                 blocks: content_blocks,
                                 auto_submit: true,
+                                auto_prompt_enabled: true,
+                                profile_id: None,
                             }),
                             true,
                             "git_panel",
@@ -409,6 +450,8 @@ pub fn init(cx: &mut App) {
                                 Some(AgentInitialContent::ContentBlock {
                                     blocks: content_blocks,
                                     auto_submit: true,
+                                    auto_prompt_enabled: true,
+                                    profile_id: None,
                                 }),
                                 true,
                                 "git_panel",
@@ -438,6 +481,8 @@ pub fn init(cx: &mut App) {
                                 Some(AgentInitialContent::ContentBlock {
                                     blocks: content_blocks,
                                     auto_submit: true,
+                                    auto_prompt_enabled: true,
+                                    profile_id: None,
                                 }),
                                 true,
                                 "git_panel",
@@ -810,6 +855,7 @@ pub struct AgentPanel {
     new_user_onboarding: Entity<AgentPanelOnboarding>,
     new_user_onboarding_upsell_dismissed: AtomicBool,
     selected_agent: Agent,
+    auto_prompt_enabled: bool,
     _thread_view_subscription: Option<Subscription>,
     _active_thread_focus_subscription: Option<Subscription>,
     _base_view_observation: Option<Subscription>,
@@ -1024,6 +1070,8 @@ impl AgentPanel {
                             AgentInitialContent::ContentBlock {
                                 blocks,
                                 auto_submit: false,
+                                auto_prompt_enabled: panel.auto_prompt_enabled,
+                                profile_id: None,
                             }
                         });
                         let thread = panel.create_agent_thread(
@@ -1173,6 +1221,7 @@ impl AgentPanel {
             new_user_onboarding: onboarding,
             thread_store,
             selected_agent: Agent::default(),
+            auto_prompt_enabled: true,
             _thread_view_subscription: None,
             _active_thread_focus_subscription: None,
             new_user_onboarding_upsell_dismissed: AtomicBool::new(OnboardingUpsell::dismissed(cx)),
@@ -1329,6 +1378,10 @@ impl AgentPanel {
     ) {
         self.set_last_created_entry_kind(AgentPanelEntryKind::Thread, cx);
         self.activate_draft(focus, trigger, window, cx);
+    }
+
+    pub fn set_auto_prompt_enabled(&mut self, enabled: bool) {
+        self.auto_prompt_enabled = enabled;
     }
 
     pub fn new_external_agent_thread(
@@ -1688,13 +1741,36 @@ impl AgentPanel {
             self.draft_thread = None;
             self._draft_editor_observation = None;
         }
-        let previous_content = self.active_initial_content(cx);
+        let initial_content = self
+            .active_initial_content(cx)
+            .map(|mut content| {
+                if let AgentInitialContent::ContentBlock {
+                    auto_prompt_enabled,
+                    ..
+                } = &mut content
+                {
+                    *auto_prompt_enabled = self.auto_prompt_enabled;
+                }
+                content
+            })
+            .or_else(|| {
+                if self.auto_prompt_enabled {
+                    Some(AgentInitialContent::ContentBlock {
+                        blocks: vec![],
+                        auto_submit: false,
+                        auto_prompt_enabled: true,
+                        profile_id: None,
+                    })
+                } else {
+                    None
+                }
+            });
         let thread = self.create_agent_thread(
             desired_agent,
             None,
             None,
             None,
-            previous_content,
+            initial_content,
             source,
             window,
             cx,
@@ -1833,6 +1909,74 @@ impl AgentPanel {
             })
         })
         .detach_and_log_err(cx);
+    }
+
+    /// Handler for `AutoPromptNewThread` — creates a new thread with the
+    /// previous thread's summary link + the external LLM's next_prompt, auto-submits.
+    fn auto_prompt_new_thread(
+        &mut self,
+        action: &AutoPromptNewThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        log::info!(
+            "[auto_prompt] auto_prompt_new_thread: creating thread (prompt {} chars, from_session_id={:?})",
+            action.next_prompt.len(),
+            action.from_session_id
+        );
+
+        let from_session_id = action.from_session_id.clone();
+        let from_title = action.from_title.clone();
+        let next_prompt = action.next_prompt.clone();
+
+        // Strip nested [@...](zed:///...) markdown links from the title to avoid
+        // [@[@...]()]() when auto_prompt chains multiple times.
+        let raw_title = from_title.as_deref().unwrap_or("Thread");
+        let mut clean_title = raw_title.to_string();
+        while let Some(rest) = clean_title.strip_prefix("[@") {
+            if let Some(end) = rest.find("](zed:///agent/thread/") {
+                clean_title = rest[..end].to_string();
+            } else {
+                break;
+            }
+        }
+
+        let mention_uri = MentionUri::Thread {
+            id: from_session_id,
+            name: clean_title,
+        };
+        let summary_link = format!("{}\n\n", mention_uri.as_link());
+
+        let full_prompt = format!("{summary_link}{next_prompt}");
+
+        let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
+            agent_client_protocol::schema::TextContent::new(full_prompt),
+        )];
+
+        let work_dirs = action.work_dirs.as_ref().map(|dirs| PathList::new(dirs));
+
+        log::info!(
+            "[auto_prompt] auto_prompt_new_thread: calling external_thread with auto_submit=true"
+        );
+
+        self.external_thread(
+            None,
+            None,
+            work_dirs,
+            None,
+            Some(AgentInitialContent::ContentBlock {
+                blocks,
+                auto_submit: true,
+                auto_prompt_enabled: true,
+                profile_id: action.profile_id.clone(),
+            }),
+            true,
+            "auto_prompt",
+            window,
+            cx,
+        );
+
+        log::info!("[auto_prompt] auto_prompt_new_thread: thread created successfully");
     }
 
     fn initial_content_for_thread_summary(
@@ -3124,6 +3268,8 @@ impl AgentPanel {
         Some(AgentInitialContent::ContentBlock {
             blocks,
             auto_submit: false,
+            auto_prompt_enabled: true,
+            profile_id: None,
         })
     }
 
